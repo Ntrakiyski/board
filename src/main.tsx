@@ -373,7 +373,7 @@ function OrganizationMenuControls() {
 		if (!isLoaded || !setActive || organizationId === orgId) return
 
 		try {
-			await setActive({ organization: organizationId })
+			await setActive({ organization: organizationId, redirectUrl: window.location.href })
 		} catch (error) {
 			console.error(error)
 			addToast({
@@ -391,11 +391,13 @@ function OrganizationMenuControls() {
 					<TldrawUiMenuItem
 						id="manage-organization"
 						label="Manage organization"
+						noClose
 						onSelect={() => openOrganizationProfile()}
 					/>
 					<TldrawUiMenuItem
 						id="create-organization"
 						label="Create organization"
+						noClose
 						onSelect={() => openCreateOrganization()}
 					/>
 				</TldrawUiMenuGroup>
@@ -413,6 +415,7 @@ function OrganizationMenuControls() {
 								key={membership.organization.id}
 								label={membership.organization.name}
 								isSelected={membership.organization.id === orgId}
+								noClose
 								onSelect={() => selectOrganization(membership.organization.id)}
 							/>
 						))}
