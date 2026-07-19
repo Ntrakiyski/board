@@ -6,6 +6,7 @@ import {
 	SignIn,
 	useAuth,
 	useClerk,
+	useOrganizationList,
 	useUser,
 } from '@clerk/clerk-react'
 import { useSync } from '@tldraw/sync'
@@ -357,21 +358,66 @@ function CreateIntegrationTokenMenuItem() {
 }
 
 function OrganizationMenuControls() {
+	const { orgId } = useAuth()
+	const { openCreateOrganization, openOrganizationProfile } = useClerk()
+	const { isLoaded, setActive, userMemberships } = useOrganizationList({
+		userMemberships: {
+			pageSize: 20,
+			keepPreviousData: true,
+		},
+	})
+	const { addToast } = useToasts()
+	const memberships = userMemberships.data ?? []
+
+	async function selectOrganization(organizationId: string) {
+		if (!isLoaded || !setActive || organizationId === orgId) return
+
+		try {
+			await setActive({ organization: organizationId })
+		} catch (error) {
+			console.error(error)
+			addToast({
+				id: 'organization-switch-failed',
+				severity: 'error',
+				title: 'Could not switch workspace',
+			})
+		}
+	}
+
 	return (
 		<TldrawUiMenuGroup id="clerk">
-			<div
-				className="organization-menu-switcher"
-				onClick={(event) => event.stopPropagation()}
-				onPointerDown={(event) => event.stopPropagation()}
-			>
-				<OrganizationSwitcher
-					hidePersonal
-					createOrganizationMode="modal"
-					organizationProfileMode="modal"
-					afterCreateOrganizationUrl={window.location.href}
-					afterSelectOrganizationUrl={window.location.href}
-				/>
-			</div>
+			<TldrawUiMenuSubmenu id="workspace" label="Workspace" size="wide">
+				<TldrawUiMenuGroup id="workspace-actions">
+					<TldrawUiMenuItem
+						id="manage-organization"
+						label="Manage organization"
+						onSelect={() => openOrganizationProfile()}
+					/>
+					<TldrawUiMenuItem
+						id="create-organization"
+						label="Create organization"
+						onSelect={() => openCreateOrganization()}
+					/>
+				</TldrawUiMenuGroup>
+				<TldrawUiMenuGroup id="workspace-list">
+					{!isLoaded && (
+						<TldrawUiMenuItem id="workspace-loading" label="Loading workspaces..." disabled onSelect={() => {}} />
+					)}
+					{isLoaded && memberships.length === 0 && (
+						<TldrawUiMenuItem id="workspace-empty" label="No workspaces found" disabled onSelect={() => {}} />
+					)}
+					{isLoaded &&
+						memberships.map((membership) => (
+							<TldrawUiMenuItem
+								id={`workspace-${membership.organization.id}`}
+								key={membership.organization.id}
+								label={membership.organization.name}
+								isSelected={membership.organization.id === orgId}
+								onSelect={() => selectOrganization(membership.organization.id)}
+							/>
+						))}
+				</TldrawUiMenuGroup>
+			</TldrawUiMenuSubmenu>
 		</TldrawUiMenuGroup>
 	)
 }
@@ -494,15 +540,28 @@ const components: TLComponents = {
 }
 
 function SyncedBoard({ roomId, syncUri }: { roomId: string; syncUri: string }) {
-	const store = useSync({
+	const syncedStore = useSync({
 		uri: syncUri,
 		assets: multiplayerAssets,
 	})
 
+	if (syncedStore.status === 'loading') {
+		return <AuthScreen title="Opening board" description="Connecting to the live board..." />
+	}
+
+	if (syncedStore.status === 'error') {
+		return (
+			<AuthScreen
+				title="Board sync failed"
+				description={syncedStore.error?.message ?? 'Could not connect to the live board.'}
+			/>
+		)
+	}
+
 	return (
 		<main className="canvas-root">
 			<Tldraw
-				store={store}
+				store={syncedStore.store}
 				components={components}
 				licenseKey={import.meta.env.VITE_TLDRAW_LICENSE_KEY}
 				autoFocus
