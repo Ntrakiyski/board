@@ -1,0 +1,222 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "tldraw self-host board API",
+    "version": "0.1.0",
+    "description": "REST API for synced tldraw boards. The API operates on raw tldraw records so agents and other apps can read and write the same room data used by the web editor."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Check service health",
+        "responses": {
+          "200": {
+            "description": "Service is healthy"
+          }
+        }
+      }
+    },
+    "/api/boards": {
+      "get": {
+        "operationId": "listBoards",
+        "summary": "List known boards with metadata, sorted by creation date descending",
+        "responses": {
+          "200": {
+            "description": "Known boards"
+          }
+        }
+      }
+    },
+    "/api/boards/{roomId}": {
+      "get": {
+        "operationId": "readBoard",
+        "summary": "Read board records grouped by type",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Board records"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "renameBoard",
+        "summary": "Rename a board",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated board metadata"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteBoard",
+        "summary": "Delete a board and its persisted room data",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Board deleted"
+          }
+        }
+      }
+    },
+    "/api/boards/{roomId}/snapshot": {
+      "get": {
+        "operationId": "getBoardSnapshot",
+        "summary": "Read the full tldraw sync room snapshot",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Room snapshot"
+          }
+        }
+      }
+    },
+    "/api/boards/{roomId}/records": {
+      "post": {
+        "operationId": "createOrUpdateRecords",
+        "summary": "Create or update raw tldraw records",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["records"],
+                "properties": {
+                  "records": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Records written"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteRecords",
+        "summary": "Delete records by ID",
+        "parameters": [
+          {
+            "name": "roomId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["recordIds"],
+                "properties": {
+                  "recordIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Records deleted"
+          }
+        }
+      }
+    },
+    "/mcp": {
+      "post": {
+        "operationId": "mcp",
+        "summary": "MCP Streamable HTTP endpoint",
+        "responses": {
+          "200": {
+            "description": "MCP response"
+          }
+        }
+      }
+    }
+  }
+}
