@@ -3,7 +3,7 @@
   "info": {
     "title": "tldraw self-host board API",
     "version": "0.1.0",
-    "description": "REST API for synced tldraw boards. The API operates on raw tldraw records so agents and other apps can read and write the same room data used by the web editor."
+    "description": "REST API for synced tldraw boards. Protected endpoints accept either a Clerk organization JWT for human sessions or a Board workspace token for agents and integrations."
   },
   "servers": [
     {
@@ -25,7 +25,8 @@
     "/api/boards": {
       "get": {
         "operationId": "listBoards",
-        "summary": "List known boards with metadata, sorted by creation date descending",
+        "summary": "List boards visible in the authenticated workspace",
+        "security": [{ "bearerAuth": [] }],
         "responses": {
           "200": {
             "description": "Known boards"
@@ -37,6 +38,7 @@
       "get": {
         "operationId": "readBoard",
         "summary": "Read board records grouped by type",
+        "security": [{ "bearerAuth": [] }],
         "parameters": [
           {
             "name": "roomId",
@@ -56,6 +58,7 @@
       "patch": {
         "operationId": "renameBoard",
         "summary": "Rename a board",
+        "security": [{ "bearerAuth": [] }],
         "parameters": [
           {
             "name": "roomId",
@@ -90,6 +93,7 @@
       "delete": {
         "operationId": "deleteBoard",
         "summary": "Delete a board and its persisted room data",
+        "security": [{ "bearerAuth": [] }],
         "parameters": [
           {
             "name": "roomId",
@@ -111,6 +115,7 @@
       "get": {
         "operationId": "getBoardSnapshot",
         "summary": "Read the full tldraw sync room snapshot",
+        "security": [{ "bearerAuth": [] }],
         "parameters": [
           {
             "name": "roomId",
@@ -132,6 +137,7 @@
       "post": {
         "operationId": "createOrUpdateRecords",
         "summary": "Create or update raw tldraw records",
+        "security": [{ "bearerAuth": [] }],
         "parameters": [
           {
             "name": "roomId",
@@ -171,6 +177,7 @@
       "delete": {
         "operationId": "deleteRecords",
         "summary": "Delete records by ID",
+        "security": [{ "bearerAuth": [] }],
         "parameters": [
           {
             "name": "roomId",
@@ -207,15 +214,57 @@
         }
       }
     },
+    "/api/integration-tokens": {
+      "post": {
+        "operationId": "createIntegrationToken",
+        "summary": "Create a scoped Board workspace token for agents or integrations",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": ["editor", "viewer"]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token created. The token value is returned once."
+          }
+        }
+      }
+    },
     "/mcp": {
       "post": {
         "operationId": "mcp",
         "summary": "MCP Streamable HTTP endpoint",
+        "security": [{ "bearerAuth": [] }],
         "responses": {
           "200": {
             "description": "MCP response"
           }
         }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT or Board workspace token",
+        "description": "Use a Clerk organization JWT for browser/user-scoped calls or a bd_ Board workspace token for agent integrations."
       }
     }
   }

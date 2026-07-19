@@ -6,6 +6,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { NodeSqliteWrapper, SQLiteSyncStorage, TLSocketRoom } from '@tldraw/sync-core'
 import Database from 'better-sqlite3'
 import fastify from 'fastify'
+import pg from 'pg'
 import {
 	copyFileSync,
 	createReadStream,
@@ -19,6 +20,7 @@ import {
 	writeFileSync,
 } from 'node:fs'
 import { createServer } from 'node:http'
+import { createHash, randomBytes } from 'node:crypto'
 import { dirname, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { z } from 'zod'
@@ -33,6 +35,9 @@ const WORKSPACES_META_PATH = join(DATA_DIR, 'workspaces.json')
 const DIST_DIR = resolve('./dist')
 const OPENAPI_PATH = resolve('./openapi.json')
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY
+const DATABASE_URL = process.env.DATABASE_URL
+const { Pool } = pg
+const pgPool = DATABASE_URL ? new Pool({ connectionString: normalizePostgresConnectionString(DATABASE_URL) }) : null
 
 mkdirSync(ROOMS_DIR, { recursive: true })
 mkdirSync(UPLOADS_DIR, { recursive: true })
@@ -50,6 +55,20 @@ const rooms = new Map()
 let boardsMeta = loadBoardsMeta()
 let workspacesMeta = loadWorkspacesMeta()
 const syncTickets = new Map()
+const snapshotTimers = new Map()
+
+function normalizePostgresConnectionString(connectionString) {
+	const url = new URL(connectionString)
+	const sslmode = url.searchParams.get('sslmode')
+	if (sslmode === 'prefer' || sslmode === 'require' || sslmode === 'verify-ca') {
+		url.searchParams.set('sslmode', 'verify-full')
+	}
+	return url.toString()
+}
+
+function hashToken(token) {
+	return createHash('sha256').update(token).digest('hex')
+}
 
 function loadBoardsMeta() {
 	if (!existsSync(BOARDS_META_PATH)) return {}
@@ -120,7 +139,7 @@ function getWorkspaceBoardMeta(workspaceId) {
 	return boardsMeta.workspaces[workspaceId]
 }
 
-function ensureBoardMeta(workspaceId, roomId) {
+function ensureLocalBoardMeta(workspaceId, roomId) {
 	const id = sanitizeId(roomId)
 	const workspaceBoards = getWorkspaceBoardMeta(workspaceId)
 	const existing = workspaceBoards[id]
@@ -138,9 +157,9 @@ function ensureBoardMeta(workspaceId, roomId) {
 	return created
 }
 
-function boardSummary(workspaceId, roomId) {
+function localBoardSummary(workspaceId, roomId) {
 	const id = sanitizeId(roomId)
-	const meta = ensureBoardMeta(workspaceId, id)
+	const meta = ensureLocalBoardMeta(workspaceId, id)
 	return {
 		id,
 		workspaceId,
@@ -151,23 +170,60 @@ function boardSummary(workspaceId, roomId) {
 	}
 }
 
+function toBoardSummary(row) {
+	return {
+		id: row.id,
+		workspaceId: row.workspace_id,
+		name: row.name || '',
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+		url: `/board/${encodeURIComponent(row.id)}`,
+	}
+}
+
+async function ensureBoardMeta(workspace, roomId) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
+	const userId = typeof workspace === 'string' ? 'local-dev' : workspace.userId
+	const id = sanitizeId(roomId)
+	if (!pgPool) return localBoardSummary(workspaceId, id)
+
+	const now = new Date().toISOString()
+	const result = await pgPool.query(
+		`insert into public.tldraw_boards (id, workspace_id, name, created_by, created_at, updated_at, deleted_at)
+		 values ($1, $2, '', $3, $4, $4, null)
+		 on conflict (workspace_id, id)
+		 do update set deleted_at = null, updated_at = public.tldraw_boards.updated_at
+		 returning id, workspace_id, name, created_at, updated_at`,
+		[id, workspaceId, userId, now]
+	)
+	return toBoardSummary(result.rows[0])
+}
+
 function getRoom(workspaceId, roomId) {
 	const id = sanitizeId(roomId)
 	const key = `${sanitizeId(workspaceId)}:${id}`
 	const existing = rooms.get(key)
 	if (existing && !existing.room.isClosed()) return existing
 
-	ensureBoardMeta(workspaceId, id)
+	ensureLocalBoardMeta(workspaceId, id)
 	mkdirSync(getWorkspaceRoomsDir(workspaceId), { recursive: true })
 	const dbPath = getBoardFilePath(workspaceId, id)
 	const db = new Database(dbPath)
 	const storage = new SQLiteSyncStorage({ sql: new NodeSqliteWrapper(db) })
 	const room = new TLSocketRoom({
 		storage,
+		onDataChange() {
+			scheduleSnapshotPersist(workspaceId, id)
+		},
 		onSessionRemoved(room, args) {
 			if (args.numSessionsRemaining === 0) {
+				void persistBoardSnapshot(workspaceId, id, 'sync-room')
 				room.close()
 				db.close()
+				const timerKey = `${sanitizeId(workspaceId)}:${id}`
+				const timer = snapshotTimers.get(timerKey)
+				if (timer) clearTimeout(timer)
+				snapshotTimers.delete(timerKey)
 				rooms.delete(key)
 			}
 		},
@@ -178,7 +234,7 @@ function getRoom(workspaceId, roomId) {
 	return entry
 }
 
-function listBoardIds(workspaceId) {
+function localBoardIds(workspaceId) {
 	const roomsDir = getWorkspaceRoomsDir(workspaceId)
 	const fromDisk = existsSync(roomsDir)
 		? readdirSync(roomsDir)
@@ -192,23 +248,58 @@ function listBoardIds(workspaceId) {
 	return [...new Set([...fromDisk, ...active, ...Object.keys(workspaceBoards)])].sort()
 }
 
-function listBoards(workspaceId) {
-	importLegacyBoardsIfNeeded(workspaceId)
-	return listBoardIds(workspaceId)
-		.map((boardId) => boardSummary(workspaceId, boardId))
-		.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || a.id.localeCompare(b.id))
+async function listBoardIds(workspace) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
+	if (!pgPool) return localBoardIds(workspaceId)
+	const dbRows = await pgPool.query(
+		`select id from public.tldraw_boards where workspace_id = $1 and deleted_at is null order by id`,
+		[workspaceId]
+	)
+	return [...new Set([...localBoardIds(workspaceId), ...dbRows.rows.map((row) => row.id)])].sort()
 }
 
-function renameBoard(workspaceId, roomId, name) {
+async function listBoards(workspace) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
+	importLegacyBoardsIfNeeded(workspaceId)
+	if (!pgPool) {
+		return localBoardIds(workspaceId)
+			.map((boardId) => localBoardSummary(workspaceId, boardId))
+			.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || a.id.localeCompare(b.id))
+	}
+
+	const ids = await listBoardIds(workspace)
+	await Promise.all(ids.map((boardId) => ensureBoardMeta(workspace, boardId)))
+	const result = await pgPool.query(
+		`select id, workspace_id, name, created_at, updated_at
+		 from public.tldraw_boards
+		 where workspace_id = $1 and deleted_at is null
+		 order by updated_at desc, id asc`,
+		[workspaceId]
+	)
+	return result.rows.map(toBoardSummary)
+}
+
+async function renameBoard(workspace, roomId, name) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
 	const id = sanitizeId(roomId)
-	const meta = ensureBoardMeta(workspaceId, id)
+	if (pgPool) await ensureBoardMeta(workspace, id)
+	const meta = ensureLocalBoardMeta(workspaceId, id)
 	meta.name = String(name ?? '').trim().slice(0, 120)
 	meta.updatedAt = new Date().toISOString()
 	saveBoardsMeta()
-	return boardSummary(workspaceId, id)
+	if (!pgPool) return localBoardSummary(workspaceId, id)
+	const result = await pgPool.query(
+		`update public.tldraw_boards
+		 set name = $3, updated_at = $4
+		 where workspace_id = $1 and id = $2 and deleted_at is null
+		 returning id, workspace_id, name, created_at, updated_at`,
+		[workspaceId, id, meta.name, meta.updatedAt]
+	)
+	return toBoardSummary(result.rows[0])
 }
 
-function deleteBoard(workspaceId, roomId) {
+async function deleteBoard(workspace, roomId) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
 	const id = sanitizeId(roomId)
 	const key = `${sanitizeId(workspaceId)}:${id}`
 	const active = rooms.get(key)
@@ -223,6 +314,13 @@ function deleteBoard(workspaceId, roomId) {
 
 	delete getWorkspaceBoardMeta(workspaceId)[id]
 	saveBoardsMeta()
+	if (pgPool) {
+		const now = new Date().toISOString()
+		await pgPool.query(
+			`update public.tldraw_boards set deleted_at = $3, updated_at = $3 where workspace_id = $1 and id = $2`,
+			[workspaceId, id, now]
+		)
+	}
 	return { ok: true, id }
 }
 
@@ -266,13 +364,16 @@ function importLegacyBoardsIfNeeded(workspaceId) {
 	saveWorkspacesMeta()
 }
 
-function getSnapshot(workspaceId, roomId) {
+async function getSnapshot(workspace, roomId) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
+	await ensureBoardMeta(workspace, roomId)
 	const { id, room } = getRoom(workspaceId, roomId)
 	return { roomId: id, workspaceId, snapshot: room.getCurrentSnapshot() }
 }
 
-function getRecords(workspaceId, roomId) {
-	const { roomId: id, snapshot } = getSnapshot(workspaceId, roomId)
+async function getRecords(workspace, roomId) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
+	const { roomId: id, snapshot } = await getSnapshot(workspace, roomId)
 	const records = snapshot.documents.map((doc) => doc.state)
 	return {
 		roomId: id,
@@ -285,6 +386,51 @@ function getRecords(workspaceId, roomId) {
 	}
 }
 
+function scheduleSnapshotPersist(workspaceId, roomId) {
+	if (!pgPool) return
+	const key = `${sanitizeId(workspaceId)}:${sanitizeId(roomId)}`
+	const existing = snapshotTimers.get(key)
+	if (existing) clearTimeout(existing)
+	const timer = setTimeout(() => {
+		snapshotTimers.delete(key)
+		void persistBoardSnapshot(workspaceId, roomId, 'sync-room')
+	}, 1000)
+	snapshotTimers.set(key, timer)
+}
+
+async function persistBoardSnapshot(workspaceId, roomId, userId) {
+	if (!pgPool) return
+	const id = sanitizeId(roomId)
+	const entry = rooms.get(`${sanitizeId(workspaceId)}:${id}`)
+	if (!entry || entry.room.isClosed()) return
+	const snapshot = entry.room.getCurrentSnapshot()
+	const now = new Date().toISOString()
+	await ensureBoardMeta({ workspaceId, userId, role: 'editor' }, id)
+	await pgPool.query(
+		`insert into public.tldraw_board_snapshots
+			(workspace_id, board_id, snapshot, document_clock, updated_by, updated_at)
+		 values ($1, $2, $3::jsonb, $4, $5, $6)
+		 on conflict (workspace_id, board_id)
+		 do update set
+			snapshot = excluded.snapshot,
+			document_clock = excluded.document_clock,
+			updated_by = excluded.updated_by,
+			updated_at = excluded.updated_at`,
+		[
+			workspaceId,
+			id,
+			JSON.stringify(snapshot),
+			Number(snapshot.documentClock ?? snapshot.clock ?? 0),
+			userId,
+			now,
+		]
+	)
+	await pgPool.query(
+		`update public.tldraw_boards set updated_at = $3 where workspace_id = $1 and id = $2 and deleted_at is null`,
+		[workspaceId, id, now]
+	)
+}
+
 function normalizeRecord(record) {
 	if (!record || typeof record !== 'object' || Array.isArray(record)) {
 		throw new Error('Each record must be an object.')
@@ -295,21 +441,29 @@ function normalizeRecord(record) {
 	return record
 }
 
-async function putRecords(workspaceId, roomId, records) {
+async function putRecords(workspace, roomId, records) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
+	const userId = typeof workspace === 'string' ? 'api' : workspace.userId
+	await ensureBoardMeta(workspace, roomId)
 	const entry = getRoom(workspaceId, roomId)
 	const normalized = records.map(normalizeRecord)
 	await entry.room.updateStore((store) => {
 		for (const record of normalized) store.put(record)
 	})
+	await persistBoardSnapshot(workspaceId, roomId, userId)
 	return { roomId: entry.id, count: normalized.length, records: normalized }
 }
 
-async function deleteRecords(workspaceId, roomId, recordIds) {
+async function deleteRecords(workspace, roomId, recordIds) {
+	const workspaceId = typeof workspace === 'string' ? workspace : workspace.workspaceId
+	const userId = typeof workspace === 'string' ? 'api' : workspace.userId
+	await ensureBoardMeta(workspace, roomId)
 	const entry = getRoom(workspaceId, roomId)
 	const ids = recordIds.map((id) => String(id))
 	await entry.room.updateStore((store) => {
 		for (const id of ids) store.delete(id)
 	})
+	await persistBoardSnapshot(workspaceId, roomId, userId)
 	return { roomId: entry.id, count: ids.length, recordIds: ids }
 }
 
@@ -347,9 +501,30 @@ function mapClerkRole(role) {
 	return 'member'
 }
 
-function ensureWorkspace(clerkOrgId, name, userId, clerkRole) {
+async function ensureWorkspace(clerkOrgId, name, userId, clerkRole) {
 	const workspaceId = sanitizeId(clerkOrgId)
 	const now = new Date().toISOString()
+	const role = mapClerkRole(clerkRole)
+	if (pgPool) {
+		const workspaceResult = await pgPool.query(
+			`insert into public.workspaces (id, clerk_org_id, name, created_at, updated_at)
+			 values ($1, $2, $3, $4, $4)
+			 on conflict (clerk_org_id)
+			 do update set name = excluded.name, updated_at = excluded.updated_at, deleted_at = null
+			 returning id, name`,
+			[workspaceId, clerkOrgId, name || clerkOrgId, now]
+		)
+		const workspace = workspaceResult.rows[0]
+		await pgPool.query(
+			`insert into public.workspace_memberships (workspace_id, user_id, role, created_at, updated_at)
+			 values ($1, $2, $3, $4, $4)
+			 on conflict (workspace_id, user_id)
+			 do update set role = excluded.role, updated_at = excluded.updated_at`,
+			[workspace.id, userId, role, now]
+		)
+		return { workspaceId: workspace.id, workspaceName: workspace.name, userId, role, authType: 'clerk' }
+	}
+
 	const existing = workspacesMeta[workspaceId]
 	if (!existing) {
 		workspacesMeta[workspaceId] = {
@@ -367,11 +542,39 @@ function ensureWorkspace(clerkOrgId, name, userId, clerkRole) {
 	workspace.members = workspace.members ?? {}
 	workspace.members[userId] = {
 		userId,
-		role: mapClerkRole(clerkRole),
+		role,
 		updatedAt: now,
 	}
 	saveWorkspacesMeta()
-	return { workspaceId, workspaceName: workspace.name, userId, role: workspace.members[userId].role }
+	return { workspaceId, workspaceName: workspace.name, userId, role: workspace.members[userId].role, authType: 'clerk' }
+}
+
+async function verifyBoardIntegrationToken(token) {
+	if (!pgPool || !token.startsWith('bd_')) return undefined
+	const now = new Date().toISOString()
+	const result = await pgPool.query(
+		`update public.tldraw_integration_tokens
+		 set last_used_at = $2
+		 where token_hash = $1 and revoked_at is null
+		 returning id, workspace_id, role, created_by`,
+		[hashToken(token), now]
+	)
+	const row = result.rows[0]
+	if (!row) return undefined
+	const workspaceResult = await pgPool.query(
+		`select id, name from public.workspaces where id = $1 and deleted_at is null`,
+		[row.workspace_id]
+	)
+	const workspace = workspaceResult.rows[0]
+	if (!workspace) return undefined
+	return {
+		workspaceId: workspace.id,
+		workspaceName: workspace.name,
+		userId: row.created_by,
+		role: row.role === 'viewer' ? 'viewer' : 'editor',
+		authType: 'integration_token',
+		tokenId: row.id,
+	}
 }
 
 function readBearerToken(req) {
@@ -386,7 +589,39 @@ async function requireWorkspace(req) {
 		error.statusCode = 401
 		throw error
 	}
+	const integrationWorkspace = token ? await verifyBoardIntegrationToken(token) : undefined
+	if (integrationWorkspace) return integrationWorkspace
 	return verifyClerkToken(token)
+}
+
+function requireWritableWorkspace(workspace) {
+	if (workspace.role === 'viewer') {
+		const error = new Error('This Board token can only read boards.')
+		error.statusCode = 403
+		throw error
+	}
+	return workspace
+}
+
+async function createIntegrationToken(workspace, input) {
+	requireWritableWorkspace(workspace)
+	if (!pgPool) {
+		const error = new Error('Integration tokens require DATABASE_URL.')
+		error.statusCode = 501
+		throw error
+	}
+	const token = `bd_${randomBytes(32).toString('base64url')}`
+	const id = `bit_${randomBytes(12).toString('hex')}`
+	const now = new Date().toISOString()
+	const name = String(input?.name ?? 'Connections').trim().slice(0, 80) || 'Connections'
+	const role = input?.role === 'viewer' ? 'viewer' : 'editor'
+	await pgPool.query(
+		`insert into public.tldraw_integration_tokens
+			(id, workspace_id, name, token_hash, role, created_by, created_at)
+		 values ($1, $2, $3, $4, $5, $6, $7)`,
+		[id, workspace.workspaceId, name, hashToken(token), role, workspace.userId, now]
+	)
+	return { id, name, role, workspaceId: workspace.workspaceId, token, createdAt: now }
 }
 
 function createSyncTicket(workspace, roomId) {
@@ -430,7 +665,7 @@ function createMcpServer(workspace) {
 			description: 'List boards known to the self-hosted tldraw server with names and timestamps.',
 			inputSchema: {},
 		},
-		async () => toolResult({ boards: listBoards(workspace.workspaceId) })
+		async () => toolResult({ boards: await listBoards(workspace) })
 	)
 
 	server.registerTool(
@@ -440,7 +675,7 @@ function createMcpServer(workspace) {
 			description: 'Read raw tldraw records for a board, grouped into records, shapes, assets, and bindings.',
 			inputSchema: { roomId: z.string().min(1) },
 		},
-		async ({ roomId }) => toolResult(getRecords(workspace.workspaceId, roomId))
+		async ({ roomId }) => toolResult(await getRecords(workspace, roomId))
 	)
 
 	server.registerTool(
@@ -450,7 +685,7 @@ function createMcpServer(workspace) {
 			description: 'Read the full tldraw sync room snapshot for a board.',
 			inputSchema: { roomId: z.string().min(1) },
 		},
-		async ({ roomId }) => toolResult(getSnapshot(workspace.workspaceId, roomId))
+		async ({ roomId }) => toolResult(await getSnapshot(workspace, roomId))
 	)
 
 	server.registerTool(
@@ -464,7 +699,8 @@ function createMcpServer(workspace) {
 				shapes: z.array(z.record(z.string(), z.any())),
 			},
 		},
-		async ({ roomId, shapes }) => toolResult(await putRecords(workspace.workspaceId, roomId, shapes))
+		async ({ roomId, shapes }) =>
+			toolResult(await putRecords(requireWritableWorkspace(workspace), roomId, shapes))
 	)
 
 	server.registerTool(
@@ -477,7 +713,8 @@ function createMcpServer(workspace) {
 				shapes: z.array(z.record(z.string(), z.any())),
 			},
 		},
-		async ({ roomId, shapes }) => toolResult(await putRecords(workspace.workspaceId, roomId, shapes))
+		async ({ roomId, shapes }) =>
+			toolResult(await putRecords(requireWritableWorkspace(workspace), roomId, shapes))
 	)
 
 	server.registerTool(
@@ -490,7 +727,8 @@ function createMcpServer(workspace) {
 				shapeIds: z.array(z.string()),
 			},
 		},
-		async ({ roomId, shapeIds }) => toolResult(await deleteRecords(workspace.workspaceId, roomId, shapeIds))
+		async ({ roomId, shapeIds }) =>
+			toolResult(await deleteRecords(requireWritableWorkspace(workspace), roomId, shapeIds))
 	)
 
 	return server
@@ -560,44 +798,49 @@ app.get('/api/auth/session', async (req) => {
 	return { authenticated: true, ...workspace }
 })
 app.post('/api/sync-tickets/:roomId', async (req) => {
-	const workspace = await requireWorkspace(req)
+	const workspace = requireWritableWorkspace(await requireWorkspace(req))
+	await ensureBoardMeta(workspace, req.params.roomId)
 	return { ticket: createSyncTicket(workspace, req.params.roomId) }
 })
 app.get('/api/boards', async (req) => {
 	const workspace = await requireWorkspace(req)
-	return { boards: listBoards(workspace.workspaceId) }
+	return { boards: await listBoards(workspace) }
 })
 app.patch('/api/boards/:roomId', async (req) => {
-	const workspace = await requireWorkspace(req)
-	return renameBoard(workspace.workspaceId, req.params.roomId, req.body?.name)
+	const workspace = requireWritableWorkspace(await requireWorkspace(req))
+	return renameBoard(workspace, req.params.roomId, req.body?.name)
 })
 app.delete('/api/boards/:roomId', async (req) => {
-	const workspace = await requireWorkspace(req)
-	return deleteBoard(workspace.workspaceId, req.params.roomId)
+	const workspace = requireWritableWorkspace(await requireWorkspace(req))
+	return deleteBoard(workspace, req.params.roomId)
 })
 app.get('/api/boards/:roomId', async (req) => {
 	const workspace = await requireWorkspace(req)
-	return getRecords(workspace.workspaceId, req.params.roomId)
+	return getRecords(workspace, req.params.roomId)
 })
 app.get('/api/boards/:roomId/snapshot', async (req) => {
 	const workspace = await requireWorkspace(req)
-	return getSnapshot(workspace.workspaceId, req.params.roomId)
+	return getSnapshot(workspace, req.params.roomId)
 })
 app.post('/api/boards/:roomId/records', async (req) => {
-	const workspace = await requireWorkspace(req)
+	const workspace = requireWritableWorkspace(await requireWorkspace(req))
 	if (!Array.isArray(req.body?.records)) {
 		throw new Error('Request body must include records array.')
 	}
 	const records = req.body.records
-	return putRecords(workspace.workspaceId, req.params.roomId, records)
+	return putRecords(workspace, req.params.roomId, records)
 })
 app.delete('/api/boards/:roomId/records', async (req) => {
-	const workspace = await requireWorkspace(req)
+	const workspace = requireWritableWorkspace(await requireWorkspace(req))
 	if (!Array.isArray(req.body?.recordIds)) {
 		throw new Error('Request body must include recordIds array.')
 	}
 	const recordIds = req.body.recordIds
-	return deleteRecords(workspace.workspaceId, req.params.roomId, recordIds)
+	return deleteRecords(workspace, req.params.roomId, recordIds)
+})
+app.post('/api/integration-tokens', async (req) => {
+	const workspace = requireWritableWorkspace(await requireWorkspace(req))
+	return createIntegrationToken(workspace, req.body)
 })
 app.get('/openapi.json', async () => openApiDocument())
 
@@ -633,6 +876,15 @@ app.post('/mcp', async (req, reply) => {
 
 app.get('/mcp', async (_, reply) => {
 	reply.code(405).header('allow', 'POST').send({ error: 'Method not allowed. Use POST.' })
+})
+
+process.once('SIGINT', () => {
+	void pgPool?.end()
+	process.exit(0)
+})
+process.once('SIGTERM', () => {
+	void pgPool?.end()
+	process.exit(0)
 })
 
 if (existsSync(DIST_DIR)) {

@@ -4,6 +4,12 @@ Self-hosted tldraw for iPad sketching, shared board URLs, REST access, and MCP a
 
 ## Run
 
+Create `.env` from `.env.example` and set the Clerk keys plus `DATABASE_URL`:
+
+```bash
+cp .env.example .env
+```
+
 ```bash
 docker compose up -d --build
 ```
@@ -23,22 +29,25 @@ http://<server-ip>:5421/board/wireframes
 
 Open the same board URL on the iPad and Mac to see the same live canvas.
 
+The app uses Clerk sign-in and Clerk Organizations as workspaces. You must select or create an Organization before opening a board. Boards are scoped to the active Organization.
+
 Use the hamburger menu for:
 
 ```text
 New board
 View boards
+Organization switcher
 ```
 
 `View boards` opens the board list. Each board can be opened, renamed, or deleted from its row menu.
-The top action row has a copy-link icon before the three-dot menu.
+The Clerk organization switcher includes Clerk's own Manage button for organization settings and invitations. The bottom-left profile avatar opens Clerk user profile. The top action row has a copy-link icon before the three-dot menu. That button copies the current board URL and opens the Clerk Organization members view so you can invite teammates.
 
 ## Storage
 
 Boards are synced through the Node server and stored as SQLite files under:
 
 ```text
-/home/vps-apps/tldraw-selfhost/data/rooms
+/home/vps-apps/tldraw-selfhost/data/workspaces/<workspace-id>/rooms
 ```
 
 Uploaded assets are stored under:
@@ -47,11 +56,48 @@ Uploaded assets are stored under:
 /home/vps-apps/tldraw-selfhost/data/uploads
 ```
 
+When `DATABASE_URL` is configured, workspace and board metadata is stored in the shared InsForge/Postgres database:
+
+```text
+workspaces
+workspace_memberships
+tldraw_boards
+tldraw_board_snapshots
+tldraw_integration_tokens
+```
+
+Without `DATABASE_URL`, the app falls back to local JSON metadata under `/home/vps-apps/tldraw-selfhost/data`.
+
 The Docker volume is `./data:/data`, so the board data survives container rebuilds.
 
 ## REST API
 
 The server exposes a REST API for agents and other apps that want to read or write the same tldraw board records used by the web editor.
+Board API requests accept either:
+
+```text
+Authorization: Bearer <Clerk organization JWT>
+Authorization: Bearer <bd_ Board workspace token>
+```
+
+The simplest way to create a scoped Board workspace token is from the Board hamburger menu:
+
+```text
+Copy Connections token
+```
+
+That creates an editor token for the active Clerk Organization workspace and copies it to your clipboard.
+
+You can also create one from the API while authenticated with Clerk:
+
+```bash
+curl -X POST http://<server-ip>:5421/api/integration-tokens \
+  -H "Authorization: Bearer <Clerk organization JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Connections","role":"editor"}'
+```
+
+The returned `bd_...` token is shown once. Store it in Connections as the Board workspace token.
 
 OpenAPI document:
 

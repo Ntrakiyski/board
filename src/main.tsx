@@ -5,6 +5,8 @@ import {
 	OrganizationSwitcher,
 	SignIn,
 	useAuth,
+	useClerk,
+	useUser,
 } from '@clerk/clerk-react'
 import { useSync } from '@tldraw/sync'
 import {
@@ -13,6 +15,7 @@ import {
 	DefaultActionsMenuContent,
 	DefaultMainMenu,
 	DefaultMainMenuContent,
+	DefaultZoomMenu,
 	getHashForString,
 	TLComponents,
 	TLAssetStore,
@@ -314,8 +317,105 @@ function BoardListSubmenu() {
 	)
 }
 
+function CreateIntegrationTokenMenuItem() {
+	const authToken = useAuthToken()
+	const { addToast } = useToasts()
+
+	return (
+		<TldrawUiMenuItem
+			id="create-connections-token"
+			icon="copy"
+			label="Copy Connections token"
+			onSelect={async () => {
+				try {
+					const response = await fetch('/api/integration-tokens', {
+						method: 'POST',
+						headers: authHeaders(authToken, true),
+						body: JSON.stringify({ name: 'Connections', role: 'editor' }),
+					})
+					if (!response.ok) throw new Error(`Failed to create token: ${response.statusText}`)
+					const data = (await response.json()) as { token?: string }
+					if (!data.token) throw new Error('Token response was empty.')
+					await copyTextToClipboard(data.token)
+					addToast({
+						id: 'connections-token-copied',
+						icon: 'clipboard-copy',
+						severity: 'success',
+						title: 'Connections token copied',
+					})
+				} catch (error) {
+					console.error(error)
+					addToast({
+						id: 'connections-token-failed',
+						severity: 'error',
+						title: 'Could not create Connections token',
+					})
+				}
+			}}
+		/>
+	)
+}
+
+function OrganizationMenuControls() {
+	return (
+		<TldrawUiMenuGroup id="clerk">
+			<div
+				className="organization-menu-switcher"
+				onClick={(event) => event.stopPropagation()}
+				onPointerDown={(event) => event.stopPropagation()}
+			>
+				<OrganizationSwitcher
+					hidePersonal
+					createOrganizationMode="modal"
+					organizationProfileMode="modal"
+					afterCreateOrganizationUrl={window.location.href}
+					afterSelectOrganizationUrl={window.location.href}
+				/>
+			</div>
+		</TldrawUiMenuGroup>
+	)
+}
+
+function openOrganizationMembers(openOrganizationProfile: ReturnType<typeof useClerk>['openOrganizationProfile']) {
+	openOrganizationProfile({ __experimental_startPath: '/organization-members' })
+}
+
+function ProfileZoomButton() {
+	const { openUserProfile } = useClerk()
+	const { user } = useUser()
+	const label = user?.fullName || user?.primaryEmailAddress?.emailAddress || 'Profile'
+	const initials =
+		(user?.firstName?.[0] ?? user?.primaryEmailAddress?.emailAddress?.[0] ?? 'P').toUpperCase()
+
+	return (
+		<TldrawUiToolbarButton
+			className="profile-zoom-button"
+			data-testid="profile.button"
+			type="icon"
+			title={label}
+			onClick={() => openUserProfile()}
+		>
+			{user?.imageUrl ? (
+				<img className="profile-zoom-button-avatar" src={user.imageUrl} alt="" />
+			) : (
+				<span className="profile-zoom-button-fallback">{initials}</span>
+			)}
+		</TldrawUiToolbarButton>
+	)
+}
+
+function BoardZoomMenu() {
+	return (
+		<>
+			<ProfileZoomButton />
+			<DefaultZoomMenu />
+		</>
+	)
+}
+
 function CopyBoardLinkButton() {
 	const { addToast } = useToasts()
+	const { openOrganizationProfile } = useClerk()
 	const [copied, setCopied] = React.useState(false)
 	const timeoutRef = React.useRef<number | null>(null)
 
@@ -343,6 +443,7 @@ function CopyBoardLinkButton() {
 					})
 					if (timeoutRef.current !== null) window.clearTimeout(timeoutRef.current)
 					timeoutRef.current = window.setTimeout(() => setCopied(false), 2200)
+					openOrganizationMembers(openOrganizationProfile)
 				} catch (error) {
 					console.error(error)
 					addToast({
@@ -367,6 +468,10 @@ function BoardMainMenu() {
 				<BoardListSubmenu />
 			</TldrawUiMenuGroup>
 			<DefaultMainMenuContent />
+			<TldrawUiMenuGroup id="board-integrations">
+				<CreateIntegrationTokenMenuItem />
+			</TldrawUiMenuGroup>
+			<OrganizationMenuControls />
 		</DefaultMainMenu>
 	)
 }
@@ -385,6 +490,7 @@ function BoardActionsMenu() {
 const components: TLComponents = {
 	MainMenu: BoardMainMenu,
 	ActionsMenu: BoardActionsMenu,
+	ZoomMenu: BoardZoomMenu,
 }
 
 function SyncedBoard({ roomId, syncUri }: { roomId: string; syncUri: string }) {
@@ -408,7 +514,7 @@ function SyncedBoard({ roomId, syncUri }: { roomId: string; syncUri: string }) {
 	)
 }
 
-function Board({ roomId, authToken }: { roomId: string; authToken: string }) {
+function Board({ roomId, authToken, workspaceId }: { roomId: string; authToken: string; workspaceId: string }) {
 	const [syncUri, setSyncUri] = React.useState<string | null>(null)
 	const [error, setError] = React.useState<string | null>(null)
 
@@ -427,7 +533,7 @@ function Board({ roomId, authToken }: { roomId: string; authToken: string }) {
 		return () => {
 			cancelled = true
 		}
-	}, [roomId, authToken])
+	}, [roomId, authToken, workspaceId])
 
 	if (error) {
 		return <AuthScreen title="Board unavailable" description={error} />
@@ -443,13 +549,27 @@ function Board({ roomId, authToken }: { roomId: string; authToken: string }) {
 	)
 }
 
-function BoardApp({ authToken }: { authToken: string }) {
+function BoardApp({ authToken, workspaceId }: { authToken: string; workspaceId: string }) {
 	const roomId = getRoomIdFromPath()
 	if (!roomId) {
 		window.history.replaceState(null, '', makeBoardUrl('personal-sketchbook'))
-		return <Board roomId="personal-sketchbook" authToken={authToken} />
+		return (
+			<Board
+				key={`${workspaceId}:personal-sketchbook`}
+				roomId="personal-sketchbook"
+				authToken={authToken}
+				workspaceId={workspaceId}
+			/>
+		)
 	}
-	return <Board roomId={roomId} authToken={authToken} />
+	return (
+		<Board
+			key={`${workspaceId}:${roomId}`}
+			roomId={roomId}
+			authToken={authToken}
+			workspaceId={workspaceId}
+		/>
+	)
 }
 
 function AuthenticatedApp() {
@@ -464,10 +584,16 @@ function AuthenticatedApp() {
 		}
 
 		let cancelled = false
+		setAuthToken(null)
 		setError(null)
 		getToken({ organizationId: orgId, skipCache: true })
 			.then((token) => {
-				if (!cancelled) setAuthToken(token)
+				if (cancelled) return
+				if (!token) {
+					setError('Could not get a Clerk token for this workspace.')
+					return
+				}
+				setAuthToken(token)
 			})
 			.catch((caught: unknown) => {
 				if (!cancelled) setError(caught instanceof Error ? caught.message : 'Could not authenticate.')
@@ -501,7 +627,7 @@ function AuthenticatedApp() {
 	if (error) return <AuthScreen title="Authentication failed" description={error} />
 	if (!authToken) return <AuthScreen title="Loading workspace" description="Preparing your workspace..." />
 
-	return <BoardApp authToken={authToken} />
+	return <BoardApp key={orgId} authToken={authToken} workspaceId={orgId} />
 }
 
 function AuthScreen(props: { title: string; description: string; children?: React.ReactNode }) {
