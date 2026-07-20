@@ -246,7 +246,11 @@ function BoardListSubmenu() {
 	const organizationSlug = useOrganizationSlug()
 	const [boards, setBoards] = React.useState<BoardSummary[]>([])
 	const [status, setStatus] = React.useState<'loading' | 'ready' | 'error'>('loading')
-	const [openActionsFor, setOpenActionsFor] = React.useState<string | null>(null)
+	const [openActions, setOpenActions] = React.useState<{
+		boardId: string
+		left: number
+		top: number
+	} | null>(null)
 	const currentRoomId = getRoomIdFromPath()
 
 	React.useEffect(() => {
@@ -268,6 +272,21 @@ function BoardListSubmenu() {
 		}
 	}, [authToken])
 
+	React.useEffect(() => {
+		if (!openActions) return
+
+		function closeActions() {
+			setOpenActions(null)
+		}
+
+		window.addEventListener('resize', closeActions)
+		window.addEventListener('scroll', closeActions, true)
+		return () => {
+			window.removeEventListener('resize', closeActions)
+			window.removeEventListener('scroll', closeActions, true)
+		}
+	}, [openActions])
+
 	async function renameBoard(board: BoardSummary) {
 		const nextName = window.prompt('Board name', board.name || board.id)
 		if (nextName === null) return
@@ -280,7 +299,7 @@ function BoardListSubmenu() {
 		if (!response.ok) throw new Error(`Failed to rename board: ${response.statusText}`)
 		const updated = (await response.json()) as BoardSummary
 		setBoards((current) => current.map((item) => (item.id === updated.id ? updated : item)))
-		setOpenActionsFor(null)
+		setOpenActions(null)
 	}
 
 	async function removeBoard(board: BoardSummary) {
@@ -292,12 +311,29 @@ function BoardListSubmenu() {
 		})
 		if (!response.ok) throw new Error(`Failed to delete board: ${response.statusText}`)
 		setBoards((current) => current.filter((item) => item.id !== board.id))
-		setOpenActionsFor(null)
+		setOpenActions(null)
 
 		if (currentRoomId === board.id) {
 			window.location.href = makeAbsoluteBoardUrl('personal-sketchbook', organizationSlug)
 		}
 	}
+
+	function toggleActions(boardId: string, button: HTMLButtonElement) {
+		const rect = button.getBoundingClientRect()
+		const menuWidth = 136
+		const menuHeight = 92
+		const left = Math.max(8, Math.min(window.innerWidth - menuWidth - 8, rect.right - menuWidth))
+		const preferredTop = rect.bottom + 6
+		const top =
+			preferredTop + menuHeight > window.innerHeight
+				? Math.max(8, rect.top - menuHeight - 6)
+				: preferredTop
+		setOpenActions((current) => (current?.boardId === boardId ? null : { boardId, left, top }))
+	}
+
+	const openActionsBoard = openActions
+		? boards.find((board) => board.id === openActions.boardId)
+		: undefined
 
 	return (
 		<TldrawUiMenuSubmenu id="view-boards" label="View boards" size="wide">
@@ -329,24 +365,29 @@ function BoardListSubmenu() {
 										aria-label={`Actions for ${getBoardLabel(board)}`}
 										onClick={(event) => {
 											event.stopPropagation()
-											setOpenActionsFor((current) => (current === board.id ? null : board.id))
+											toggleActions(board.id, event.currentTarget)
 										}}
 									>
 										<TldrawUiButtonIcon icon="dots-horizontal" small />
 									</button>
-									{openActionsFor === board.id && (
-										<div className="board-list-actions-menu" onClick={(event) => event.stopPropagation()}>
-											<button type="button" onClick={() => renameBoard(board)}>
-												Edit
-											</button>
-											<button type="button" onClick={() => removeBoard(board)}>
-												Delete
-											</button>
-										</div>
-									)}
 								</div>
 							</div>
 						))}
+					{openActions && openActionsBoard && (
+						<div
+							className="board-list-actions-menu"
+							style={{ left: openActions.left, top: openActions.top }}
+							onClick={(event) => event.stopPropagation()}
+							onPointerDown={(event) => event.stopPropagation()}
+						>
+							<button type="button" onClick={() => renameBoard(openActionsBoard)}>
+								Edit
+							</button>
+							<button type="button" onClick={() => removeBoard(openActionsBoard)}>
+								Delete
+							</button>
+						</div>
+					)}
 				</div>
 			</TldrawUiMenuGroup>
 		</TldrawUiMenuSubmenu>

@@ -96,8 +96,8 @@ body {
 
 .board-list-menu {
   width: 280px;
-  max-height: min(420px, calc(100vh - 96px));
-  overflow: auto;
+  max-height: none;
+  overflow: visible;
   padding: 4px;
 }
 
@@ -180,12 +180,10 @@ body {
   border-radius: 7px;
   box-shadow: 0 6px 18px rgb(0 0 0 / 16%);
   display: grid;
-  min-width: 104px;
+  min-width: 136px;
   padding: 4px;
-  position: absolute;
-  right: 0;
-  top: 32px;
-  z-index: 1000;
+  position: fixed;
+  z-index: 10000;
 }
 
 .board-list-actions-menu button {
