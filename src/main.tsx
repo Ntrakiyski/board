@@ -6,6 +6,7 @@ import {
 	SignIn,
 	useAuth,
 	useClerk,
+	useOrganization,
 	useOrganizationList,
 	useUser,
 } from '@clerk/clerk-react'
@@ -42,6 +43,7 @@ type BoardSummary = {
 }
 
 const AuthTokenContext = React.createContext<string | null>(null)
+const OrganizationSlugContext = React.createContext<string | null>(null)
 
 function useAuthToken() {
 	const token = React.useContext(AuthTokenContext)
@@ -49,18 +51,48 @@ function useAuthToken() {
 	return token
 }
 
+function useOrganizationSlug() {
+	return React.useContext(OrganizationSlugContext)
+}
+
+function getBoardRouteFromPath() {
+	const parts = window.location.pathname.split('/').filter(Boolean)
+	if (parts[0] === 'board' && parts[1]) {
+		return { organizationSlug: null, roomId: decodeURIComponent(parts[1]) }
+	}
+	if (parts[1] === 'board' && parts[2]) {
+		return { organizationSlug: decodeURIComponent(parts[0]), roomId: decodeURIComponent(parts[2]) }
+	}
+	return { organizationSlug: null, roomId: null }
+}
+
 function getRoomIdFromPath() {
-	const [, prefix, rawRoomId] = window.location.pathname.split('/')
-	if (prefix !== 'board' || !rawRoomId) return null
-	return decodeURIComponent(rawRoomId)
+	return getBoardRouteFromPath().roomId
 }
 
-function makeBoardUrl(roomId: string) {
-	return `/board/${encodeURIComponent(roomId)}`
+function slugify(value: string | null | undefined) {
+	return (
+		value
+			?.normalize('NFKD')
+			.replace(/[\u0300-\u036f]/g, '')
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, '-')
+			.replace(/^-+|-+$/g, '')
+			.slice(0, 80) || ''
+	)
 }
 
-function makeAbsoluteBoardUrl(roomId: string) {
-	return `${window.location.origin}${makeBoardUrl(roomId)}`
+function getOrganizationUrlSlug(name: string | null | undefined, fallbackId: string | null | undefined) {
+	return slugify(name) || slugify(fallbackId) || 'workspace'
+}
+
+function makeBoardUrl(roomId: string, organizationSlug?: string | null) {
+	const boardPath = `/board/${encodeURIComponent(roomId)}`
+	return organizationSlug ? `/${encodeURIComponent(organizationSlug)}${boardPath}` : boardPath
+}
+
+function makeAbsoluteBoardUrl(roomId: string, organizationSlug?: string | null) {
+	return `${window.location.origin}${makeBoardUrl(roomId, organizationSlug)}`
 }
 
 function getOrigin() {
@@ -195,13 +227,15 @@ async function copyTextToClipboard(text: string) {
 }
 
 function NewBoardMenuItem() {
+	const organizationSlug = useOrganizationSlug()
+
 	return (
 		<TldrawUiMenuItem
 			id="new-board"
 			icon="plus"
 			label="New board"
 			onSelect={() => {
-				window.location.href = makeAbsoluteBoardUrl(createBoardId())
+				window.location.href = makeAbsoluteBoardUrl(createBoardId(), organizationSlug)
 			}}
 		/>
 	)
@@ -209,6 +243,7 @@ function NewBoardMenuItem() {
 
 function BoardListSubmenu() {
 	const authToken = useAuthToken()
+	const organizationSlug = useOrganizationSlug()
 	const [boards, setBoards] = React.useState<BoardSummary[]>([])
 	const [status, setStatus] = React.useState<'loading' | 'ready' | 'error'>('loading')
 	const [openActionsFor, setOpenActionsFor] = React.useState<string | null>(null)
@@ -260,7 +295,7 @@ function BoardListSubmenu() {
 		setOpenActionsFor(null)
 
 		if (currentRoomId === board.id) {
-			window.location.href = makeAbsoluteBoardUrl('personal-sketchbook')
+			window.location.href = makeAbsoluteBoardUrl('personal-sketchbook', organizationSlug)
 		}
 	}
 
@@ -280,7 +315,7 @@ function BoardListSubmenu() {
 								data-current={currentRoomId === board.id}
 								key={board.id}
 								onClick={() => {
-									window.location.href = makeAbsoluteBoardUrl(board.id)
+									window.location.href = makeAbsoluteBoardUrl(board.id, organizationSlug)
 								}}
 							>
 								<div className="board-list-row-main">
@@ -369,11 +404,14 @@ function OrganizationMenuControls() {
 	const { addToast } = useToasts()
 	const memberships = userMemberships.data ?? []
 
-	async function selectOrganization(organizationId: string) {
+	async function selectOrganization(organizationId: string, organizationSlug: string) {
 		if (!isLoaded || !setActive || organizationId === orgId) return
 
 		try {
-			await setActive({ organization: organizationId, redirectUrl: window.location.href })
+			await setActive({
+				organization: organizationId,
+				redirectUrl: makeAbsoluteBoardUrl(getRoomIdFromPath() ?? 'personal-sketchbook', organizationSlug),
+			})
 		} catch (error) {
 			console.error(error)
 			addToast({
@@ -410,18 +448,37 @@ function OrganizationMenuControls() {
 					)}
 					{isLoaded &&
 						memberships.map((membership) => (
-							<TldrawUiMenuItem
-								id={`workspace-${membership.organization.id}`}
+							<WorkspaceMenuItem
 								key={membership.organization.id}
-								label={membership.organization.name}
-								isSelected={membership.organization.id === orgId}
-								noClose
-								onSelect={() => selectOrganization(membership.organization.id)}
+								name={membership.organization.name}
+								organizationId={membership.organization.id}
+								selected={membership.organization.id === orgId}
+								onSelect={selectOrganization}
 							/>
 						))}
 				</TldrawUiMenuGroup>
 			</TldrawUiMenuSubmenu>
 		</TldrawUiMenuGroup>
+	)
+}
+
+function WorkspaceMenuItem(props: {
+	name: string
+	organizationId: string
+	selected: boolean
+	onSelect: (organizationId: string, organizationSlug: string) => void
+}) {
+	const organizationSlug = getOrganizationUrlSlug(props.name, props.organizationId)
+
+	return (
+		<TldrawUiMenuItem
+			id={`workspace-${props.organizationId}`}
+			label={props.name}
+			iconLeft={props.selected ? 'check' : undefined}
+			isSelected={props.selected}
+			noClose
+			onSelect={() => props.onSelect(props.organizationId, organizationSlug)}
+		/>
 	)
 }
 
@@ -611,31 +668,48 @@ function Board({ roomId, authToken, workspaceId }: { roomId: string; authToken: 
 	)
 }
 
-function BoardApp({ authToken, workspaceId }: { authToken: string; workspaceId: string }) {
-	const roomId = getRoomIdFromPath()
+function BoardApp({
+	authToken,
+	organizationSlug,
+	workspaceId,
+}: {
+	authToken: string
+	organizationSlug: string
+	workspaceId: string
+}) {
+	const route = getBoardRouteFromPath()
+	const roomId = route.roomId
 	if (!roomId) {
-		window.history.replaceState(null, '', makeBoardUrl('personal-sketchbook'))
+		window.history.replaceState(null, '', makeBoardUrl('personal-sketchbook', organizationSlug))
 		return (
+			<OrganizationSlugContext.Provider value={organizationSlug}>
+				<Board
+					key={`${workspaceId}:personal-sketchbook`}
+					roomId="personal-sketchbook"
+					authToken={authToken}
+					workspaceId={workspaceId}
+				/>
+			</OrganizationSlugContext.Provider>
+		)
+	}
+	if (route.organizationSlug !== organizationSlug) {
+		window.history.replaceState(null, '', makeBoardUrl(roomId, organizationSlug))
+	}
+	return (
+		<OrganizationSlugContext.Provider value={organizationSlug}>
 			<Board
-				key={`${workspaceId}:personal-sketchbook`}
-				roomId="personal-sketchbook"
+				key={`${workspaceId}:${roomId}`}
+				roomId={roomId}
 				authToken={authToken}
 				workspaceId={workspaceId}
 			/>
-		)
-	}
-	return (
-		<Board
-			key={`${workspaceId}:${roomId}`}
-			roomId={roomId}
-			authToken={authToken}
-			workspaceId={workspaceId}
-		/>
+		</OrganizationSlugContext.Provider>
 	)
 }
 
 function AuthenticatedApp() {
 	const { isLoaded, isSignedIn, orgId, getToken } = useAuth()
+	const { organization } = useOrganization()
 	const [authToken, setAuthToken] = React.useState<string | null>(null)
 	const [error, setError] = React.useState<string | null>(null)
 
@@ -689,7 +763,14 @@ function AuthenticatedApp() {
 	if (error) return <AuthScreen title="Authentication failed" description={error} />
 	if (!authToken) return <AuthScreen title="Loading workspace" description="Preparing your workspace..." />
 
-	return <BoardApp key={orgId} authToken={authToken} workspaceId={orgId} />
+	return (
+		<BoardApp
+			key={orgId}
+			authToken={authToken}
+			organizationSlug={getOrganizationUrlSlug(organization?.name, orgId)}
+			workspaceId={orgId}
+		/>
+	)
 }
 
 function AuthScreen(props: { title: string; description: string; children?: React.ReactNode }) {
